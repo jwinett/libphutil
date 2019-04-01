@@ -95,17 +95,35 @@ abstract class AphrontBaseMySQLDatabaseConnection
         'database'  => $database,
       ));
 
-    $retries = max(1, $this->getConfiguration('retries', 3));
-    while ($retries--) {
+    // If we receive these errors, we'll retry the connection up to the
+    // retry limit. For other errors, we'll fail immediately.
+    $retry_codes = array(
+      // "Connection Timeout"
+      2002 => true,
+
+      // "Unable to Connect"
+      2003 => true,
+    );
+
+    $max_retries = max(1, $this->getConfiguration('retries', 3));
+    for ($attempt = 1; $attempt <= $max_retries; $attempt++) {
       try {
         $conn = $this->connect();
         $profiler->endServiceCall($call_id, array());
         break;
       } catch (AphrontQueryException $ex) {
-        if ($retries && $ex->getCode() == 2003) {
-          $class = get_class($ex);
-          $message = $ex->getMessage();
-          phlog(pht('Retrying (%d) after %s: %s', $retries, $class, $message));
+        $code = $ex->getCode();
+        if (($attempt < $max_retries) && isset($retry_codes[$code])) {
+          $message = pht(
+            'Retrying database connection to "%s" after connection '.
+            'failure (attempt %d; "%s"; error #%d): %s',
+            $host,
+            $attempt,
+            get_class($ex),
+            $code,
+            $ex->getMessage());
+
+          phlog($message);
         } else {
           $profiler->endServiceCall($call_id, array());
           throw $ex;
@@ -152,7 +170,10 @@ abstract class AphrontBaseMySQLDatabaseConnection
     return $result;
   }
 
-  public function executeRawQuery($raw_query) {
+  public function executeQuery(PhutilQueryString $query) {
+    $display_query = $query->getMaskedString();
+    $raw_query = $query->getUnmaskedString();
+
     $this->lastResult = null;
     $retries = max(1, $this->getConfiguration('retries', 3));
     while ($retries--) {
@@ -165,7 +186,7 @@ abstract class AphrontBaseMySQLDatabaseConnection
           array(
             'type'    => 'query',
             'config'  => $this->configuration,
-            'query'   => $raw_query,
+            'query'   => $display_query,
             'write'   => $is_write,
           ));
 
@@ -297,10 +318,10 @@ abstract class AphrontBaseMySQLDatabaseConnection
         throw new AphrontConnectionLostQueryException($message);
       case 2006: // Gone Away
         $more = pht(
-          "This error may occur if your MySQL '%s' or '%s' ".
-          "configuration values are set too low.",
-          'wait_timeout',
-          'max_allowed_packet');
+          'This error may occur if your configured MySQL "wait_timeout" or '.
+          '"max_allowed_packet" values are too small. This may also indicate '.
+          'that something used the MySQL "KILL <process>" command to kill '.
+          'the connection running the query.');
         throw new AphrontConnectionLostQueryException("{$message}\n\n{$more}");
       case 1213: // Deadlock
         throw new AphrontDeadlockQueryException($message);
